@@ -154,7 +154,7 @@ ACK:
 		*(cloned_skb->data + ETH_HDR_LEN) = custom;
 		/* change idp order */
 		read_lock(&fb_priv_cpu->rx_lock);		
-		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R */
+		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R on port */
 		read_unlock(&fb_priv_cpu->rx_lock);
 		/* schedule packet */
 		engine_backlog_tail(cloned_skb, TYPE_EGRESS);
@@ -308,6 +308,7 @@ static void fb_crr_rx_dtor(struct fblock *fb)
 
 	write_lock(&fb_priv_cpu->rx_lock);
 	for (i = 0; i < fb_priv_cpu->list->qlen; i++) {
+		/* TODO: kfree() und list->next updaten */
 		 skb_unlink(fb_priv_cpu->list->next, fb_priv_cpu->list);
 	}
 	kfree(fb_priv_cpu->list);
