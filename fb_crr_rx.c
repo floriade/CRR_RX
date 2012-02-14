@@ -36,24 +36,23 @@ struct fb_crr_rx_priv {
 	struct sk_buff_head *list;
 };
 
-/*static struct sk_buff *skb_get_pos(unsigned char seq, 
-					 struct sk_buff_head *list);*/
 
-/* returns a pointer to the skb_buff with the following seq number */
+/* returns a pointer to the skb_buff with the according seq number */
 static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
 {
 	struct sk_buff *curr = list->next;
 
-	/* list is empty */
-	if (list->next == list->prev)
+	if (list->next == list->prev)						/* list is empty */
 		return list->next;
-	/* Second element */
-	else if (seq == 2)
+	
+	else if (seq == 2)							/* Second element */
 		return list->next;
-	/* others */
-	while(1) {
-	if (curr->cb[47] > seq)
-		break;
+		
+	while(1) {								/* Others */
+		if ((*(curr->data + ETH_HDR_LEN) >> 4) > seq)
+			break;
+		else if ((*(curr->data + ETH_HDR_LEN) >> 4) == seq)		/* identical copy */
+			return 0;
 	
 		if (curr->next == list->next)
 			break;
@@ -67,7 +66,7 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 			  enum path_type * const dir)
 {
 	int drop = 0;
-	unsigned int i;
+	unsigned int i, queue_len;
 	unsigned char mac_src[14];
 	unsigned char mac_dst[14];
 	unsigned char custom, seq, ack;
@@ -95,69 +94,65 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 		custom = *(skb->data + ETH_HDR_LEN);
 		seq = custom >> 4;
 		ack = custom & 0xF;
-		/* Correct sequence number: */		
-		/* Pass current and in line packets */
+		printk(KERN_ERR "Received packet: Seq: %d\n", seq);
 		write_lock(&fb_priv_cpu->rx_lock);		
-		if (seq == fb_priv_cpu->rx_seq_nr) { /* R */
-			/* First element */
-			skb_last = fb_priv_cpu->list->next; /* R */
-			/* iterate over nr elements in queue */
-			for (i = 1; i <= fb_priv_cpu->list->qlen; i++) { /* R */
-				if (skb_last->cb[47] == seq + i) {
-					/* if next seq nr in buffer -> schedule */
-					/* remove from list */
-					skb_unlink(skb_last, fb_priv_cpu->list); /* W */
-					engine_backlog_tail(skb_last, *dir);
+		if (seq == fb_priv_cpu->rx_seq_nr) { 				/* R Correct sequence number: */
+			queue_len = skb_queue_len(fb_priv_cpu->list);
+			printk(KERN_ERR "Qlen: %d\n", queue_len);		
+			for (i = 1; i <= queue_len; i++) { 			/* R iterate over nr elements in queue */
+				skb_last = skb_peek(fb_priv_cpu->list);
+				if ((*(skb_last->data + ETH_HDR_LEN) >> 4) == seq + i) {
+					skb_last = skb_dequeue(fb_priv_cpu->list);/* Remove first element in list */
+					engine_backlog_tail(skb_last, *dir);	/* Send towards user space */
 				}
-				else
-					/* if next missing -> break */
-					break;
-
-				skb_last = skb_last->next;	/* R */		
+				else						/* if next missing -> break */
+					break;	
 			}
 
-			if (fb_priv_cpu->rx_seq_nr++ == 2*WIN_SZ) /* W */
-				fb_priv_cpu->rx_seq_nr = 1;	/* W */
+			fb_priv_cpu->rx_seq_nr = (fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
 			write_unlock(&fb_priv_cpu->rx_lock);
 		}
-		/* Wrong sequence number: */
-		/* Keep packet in buffer */
 		else {
-			/* write seq nr in control buffer */
-			skb->cb[47] = seq;
-			/* find correct position */
-			skb_last = skb_get_pos(seq, fb_priv_cpu->list); /* R */
-			/* insert to position */
-			skb_insert(skb_last, skb, fb_priv_cpu->list); /* W */
-			write_unlock(&fb_priv_cpu->rx_lock);
-			drop = 2;
+			printk(KERN_ERR "Wrong Seq!\n");		/* Wrong Seq number -> keep in buffer */
+			if ((skb_last = skb_get_pos(seq, fb_priv_cpu->list))) {	/* R find correct position */
+				skb_insert(skb_last, skb, fb_priv_cpu->list); 	/* W insert to position */
+				write_unlock(&fb_priv_cpu->rx_lock);
+				drop = 2;
+			}
+			else
+				drop = 1;					/* Received packet for second time */
 		}
+		printk(KERN_ERR "Send ACK!\n");
 		goto ACK;
 	}
 back:	
 	if (drop == 1) {
 		kfree_skb(skb);
+		//printk(KERN_ERR "Freed and dropped!\n");
 		return PPE_DROPPED;
 	}
-	else if (drop == 2)
+	else if (drop == 2) {
+		printk(KERN_ERR "Dropped!\n");
 		return PPE_DROPPED;
+	}
+	printk(KERN_ERR "Passed on!\n");
 	return PPE_SUCCESS;
 ACK:
 	if ((cloned_skb = skb_copy(skb, GFP_ATOMIC))) {
-		/* Swap MAC Addresses */
-		memcpy(eth_hdr(cloned_skb)->h_source, mac_src, 14);
+										
+		memcpy(eth_hdr(cloned_skb)->h_source, mac_src, 14);		/* Swap MAC Addresses */
 		memcpy(eth_hdr(cloned_skb)->h_dest, mac_dst, 14);
 		memcpy(mac_dst, eth_hdr(cloned_skb)->h_source, 14);
 		memcpy(mac_src, eth_hdr(cloned_skb)->h_dest, 14);
-		/* Write ACK Code */
-		custom = custom | 0xF;
+										
+		custom = custom | 0xF;						/* Write ACK Code */
 		*(cloned_skb->data + ETH_HDR_LEN) = custom;
-		/* change idp order */
+										/* change idp order */
 		read_lock(&fb_priv_cpu->rx_lock);		
 		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R on port */
 		read_unlock(&fb_priv_cpu->rx_lock);
-		/* schedule packet */
-		engine_backlog_tail(cloned_skb, TYPE_EGRESS);
+		engine_backlog_tail(cloned_skb, TYPE_EGRESS);			/* schedule packet */
+		printk(KERN_ERR "Send ACK done!\n");	
 	}
 	goto back;
 
@@ -254,10 +249,9 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 	if (!fb_priv)
 		goto err;
 
-	if (unlikely((tmp_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL)) {
-		printk(KERN_ERR "Decoding failed!\n");
+	if (unlikely((tmp_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL))
 		goto err1;
-	}
+	
 	skb_queue_head_init(tmp_list);
 
 	get_online_cpus();
@@ -282,7 +276,7 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 	if (ret)
 		goto err3;
 	__module_get(THIS_MODULE);
-	printk(KERN_ERR "Initialization passed!\n");
+	printk(KERN_ERR "[CRR_RX] Initialization passed!\n");
 	return fb;
 err3:
 	cleanup_fblock_ctor(fb);
@@ -292,12 +286,14 @@ err1:
 	free_percpu(fb_priv);
 err:
 	kfree_fblock(fb);
+	printk(KERN_ERR "[CRR_RX] Initialization failed!\n");
 	return NULL;
 }
 
 static void fb_crr_rx_dtor(struct fblock *fb)
 {
-	int i;
+	int i, queue_len;
+	struct sk_buff *skb_last;
 	struct fb_crr_rx_priv *fb_priv_cpu;
 	struct fb_crr_rx_priv __percpu *fb_priv;
 
@@ -307,16 +303,17 @@ static void fb_crr_rx_dtor(struct fblock *fb)
 	rcu_read_unlock();
 
 	write_lock(&fb_priv_cpu->rx_lock);
-	for (i = 0; i < fb_priv_cpu->list->qlen; i++) {
-		/* TODO: kfree() und list->next updaten */
-		 skb_unlink(fb_priv_cpu->list->next, fb_priv_cpu->list);
+	queue_len = skb_queue_len(fb_priv_cpu->list);
+	for (i = 0; i < queue_len; i++) {
+		skb_last = skb_dequeue(fb_priv_cpu->list);
+		kfree(skb_last);
 	}
 	kfree(fb_priv_cpu->list);
 	write_unlock(&fb_priv_cpu->rx_lock);
 
 	free_percpu(rcu_dereference_raw(fb->private_data));
 	module_put(THIS_MODULE);
-	printk(KERN_ERR "Deinitialization passed!\n");
+	printk(KERN_ERR "[CRR_RX] Deinitialization passed!\n");
 }
 
 static struct fblock_factory fb_crr_rx_factory = {
