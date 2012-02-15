@@ -25,14 +25,14 @@
 #include "xt_engine.h"
 #include "xt_builder.h"
 
-#define ETH_HDR_LEN	14
+#define ETH_HDR_LEN	0
 #define WIN_SZ		2
 
 struct fb_crr_rx_priv {
 	idp_t port[2];
 	seqlock_t lock;
 	rwlock_t rx_lock;
-	unsigned char rx_seq_nr;
+	unsigned char *rx_seq_nr;
 	struct sk_buff_head *list;
 };
 
@@ -42,20 +42,28 @@ static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
 {
 	struct sk_buff *curr = list->next;
 
-	if (list->next == list->prev)						/* list is empty */
+	if (list->next == (struct sk_buff *)list) {				/* list is empty */
+		printk(KERN_ERR "List is empty\n");		
 		return list->next;
+	}
 	
-	else if (seq == 2)							/* Second element */
+	else if (seq == 2) {							/* Second element */
+		printk(KERN_ERR "Seqnr 2 -> First element\n");
 		return list->next;
+	}	
 		
 	while(1) {								/* Others */
 		if ((*(curr->data + ETH_HDR_LEN) >> 4) > seq)
 			break;
-		else if ((*(curr->data + ETH_HDR_LEN) >> 4) == seq)		/* identical copy */
+		else if ((*(curr->data + ETH_HDR_LEN) >> 4) == seq) {		/* identical copy */
+			printk(KERN_ERR "Identical copy exists\n");
 			return 0;
+		}
 	
-		if (curr->next == list->next)
-			break;
+		if (curr->next == (struct sk_buff *)list) {
+			printk(KERN_ERR "Reached end of the list\n");
+			return (struct sk_buff *)list;
+		}
 		curr = curr->next;
 	}
 	return curr;
@@ -67,8 +75,8 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 {
 	int drop = 0;
 	unsigned int i, queue_len;
-	unsigned char mac_src[14];
-	unsigned char mac_dst[14];
+	unsigned char mac_src[6];
+	unsigned char mac_dst[6];
 	unsigned char custom, seq, ack;
 	struct sk_buff *skb_last, *cloned_skb;
 	struct fb_crr_rx_priv __percpu *fb_priv_cpu;
@@ -79,11 +87,11 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 #endif
 	prefetchw(skb->cb);
 	do {
-		seq = read_seqbegin(&fb_priv_cpu->lock);
+		seq = read_seqbegin(&fb_priv_cpu->lock);			// LOCK
 		write_next_idp_to_skb(skb, fb->idp, fb_priv_cpu->port[*dir]);
 		if (fb_priv_cpu->port[*dir] == IDP_UNKNOWN)
 			drop = 1;
-	} while (read_seqretry(&fb_priv_cpu->lock, seq));
+	} while (read_seqretry(&fb_priv_cpu->lock, seq));			// UNLOCK
 	/* Send */
 	if (*dir == TYPE_EGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba) {
 
@@ -94,29 +102,41 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 		custom = *(skb->data + ETH_HDR_LEN);
 		seq = custom >> 4;
 		ack = custom & 0xF;
-		printk(KERN_ERR "Received packet: Seq: %d\n", seq);
-		write_lock(&fb_priv_cpu->rx_lock);		
-		if (seq == fb_priv_cpu->rx_seq_nr) { 				/* R Correct sequence number: */
+		printk(KERN_ERR "Received packet\n");
+		write_lock(&fb_priv_cpu->rx_lock);				// LOCK
+		printk(KERN_ERR "Expected: %d\n", *fb_priv_cpu->rx_seq_nr);
+		printk(KERN_ERR "Received: %d\n", seq);		
+		if (seq == *fb_priv_cpu->rx_seq_nr) {
+			printk(KERN_ERR "Correct Seqnr: %d\n", seq);		/* R Correct sequence number: */
 			queue_len = skb_queue_len(fb_priv_cpu->list);
 			printk(KERN_ERR "Qlen: %d\n", queue_len);		
 			for (i = 1; i <= queue_len; i++) { 			/* R iterate over nr elements in queue */
+				//printk(KERN_ERR "%d\n", i);
 				skb_last = skb_peek(fb_priv_cpu->list);
+				printk(KERN_ERR "First Seqnr in Queue: %d\n", *(skb_last->data + ETH_HDR_LEN) >> 4);
 				if ((*(skb_last->data + ETH_HDR_LEN) >> 4) == seq + i) {
+					printk(KERN_ERR "Send following Seqnr: %d\n", seq + i);
 					skb_last = skb_dequeue(fb_priv_cpu->list);/* Remove first element in list */
 					engine_backlog_tail(skb_last, *dir);	/* Send towards user space */
+					*fb_priv_cpu->rx_seq_nr = (*fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
 				}
-				else						/* if next missing -> break */
-					break;	
+				else {
+					printk(KERN_ERR "Following Seqnr not found: %d\n", seq + i);	/* if next missing -> break */
+					break;
+				}	
 			}
 
-			fb_priv_cpu->rx_seq_nr = (fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
-			write_unlock(&fb_priv_cpu->rx_lock);
+			*fb_priv_cpu->rx_seq_nr = (*fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
+			printk(KERN_ERR "Next Seqnr expected: %d\n", *fb_priv_cpu->rx_seq_nr);
+			write_unlock(&fb_priv_cpu->rx_lock);			// UNLOCK
 		}
 		else {
-			printk(KERN_ERR "Wrong Seq!\n");		/* Wrong Seq number -> keep in buffer */
+			printk(KERN_ERR "Wrong Seqnr: %d\n", seq);		/* Wrong Seq number -> keep in buffer */
 			if ((skb_last = skb_get_pos(seq, fb_priv_cpu->list))) {	/* R find correct position */
 				skb_insert(skb_last, skb, fb_priv_cpu->list); 	/* W insert to position */
-				write_unlock(&fb_priv_cpu->rx_lock);
+				queue_len = skb_queue_len(fb_priv_cpu->list);
+				printk(KERN_ERR "Added New Qlen: %d\n", queue_len);
+				write_unlock(&fb_priv_cpu->rx_lock);		// UNLOCK
 				drop = 2;
 			}
 			else
@@ -138,19 +158,28 @@ back:
 	printk(KERN_ERR "Passed on!\n");
 	return PPE_SUCCESS;
 ACK:
-	if ((cloned_skb = skb_copy(skb, GFP_ATOMIC))) {
-										
-		memcpy(eth_hdr(cloned_skb)->h_source, mac_src, 14);		/* Swap MAC Addresses */
-		memcpy(eth_hdr(cloned_skb)->h_dest, mac_dst, 14);
-		memcpy(mac_dst, eth_hdr(cloned_skb)->h_source, 14);
-		memcpy(mac_src, eth_hdr(cloned_skb)->h_dest, 14);
+	if ((cloned_skb = skb_copy(skb, GFP_ATOMIC))) {				// skb_copy_expand(skb, 14, 0, GFP_ATOMIC)
+
+		skb_push(cloned_skb, 14);
+		//skb_set_mac_header(cloned_skb, -14);
+
+		/*for (i = 0; i < 20; i++)
+			printk(KERN_ERR "%d\t0x%2x\n", i, *(skb->data-14+i));	
+		
+		for (i = 0; i < 20; i++)
+			printk(KERN_ERR "%d\t0x%2x\n", i, *(cloned_skb->data-14+i));*/
+							
+		memcpy(mac_src, eth_hdr(cloned_skb)->h_source, 6);		/* Swap MAC Addresses */
+		memcpy(mac_dst, eth_hdr(cloned_skb)->h_dest, 6);
+		memcpy(eth_hdr(cloned_skb)->h_source, mac_dst, 6);
+		memcpy(eth_hdr(cloned_skb)->h_dest, mac_src, 6);
 										
 		custom = custom | 0xF;						/* Write ACK Code */
 		*(cloned_skb->data + ETH_HDR_LEN) = custom;
 										/* change idp order */
-		read_lock(&fb_priv_cpu->rx_lock);		
+		read_lock(&fb_priv_cpu->rx_lock);				// LOCK		
 		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R on port */
-		read_unlock(&fb_priv_cpu->rx_lock);
+		read_unlock(&fb_priv_cpu->rx_lock);				// UNLOCK
 		engine_backlog_tail(cloned_skb, TYPE_EGRESS);			/* schedule packet */
 		printk(KERN_ERR "Send ACK done!\n");	
 	}
@@ -237,9 +266,12 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 {
 	int ret = 0;
 	unsigned int cpu;
+	unsigned char *expected_seq_nr;
 	struct sk_buff_head *tmp_list;
 	struct fblock *fb;
 	struct fb_crr_rx_priv __percpu *fb_priv;
+
+	
 
 	fb = alloc_fblock(GFP_ATOMIC);
 	if (!fb)
@@ -251,6 +283,11 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 
 	if (unlikely((tmp_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL))
 		goto err1;
+
+	if (unlikely((expected_seq_nr = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL))
+		goto err1a;
+
+	*expected_seq_nr = 1;
 	
 	skb_queue_head_init(tmp_list);
 
@@ -262,7 +299,7 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 		rwlock_init(&fb_priv_cpu->rx_lock);
 		fb_priv_cpu->port[0] = IDP_UNKNOWN;
 		fb_priv_cpu->port[1] = IDP_UNKNOWN;
-		fb_priv_cpu->rx_seq_nr = 1;
+		fb_priv_cpu->rx_seq_nr = expected_seq_nr;
 		fb_priv_cpu->list = tmp_list;
 	}
 	put_online_cpus();
@@ -281,6 +318,8 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 err3:
 	cleanup_fblock_ctor(fb);
 err2:
+	kfree(expected_seq_nr);
+err1a:
 	kfree(tmp_list);
 err1:
 	free_percpu(fb_priv);
@@ -302,14 +341,15 @@ static void fb_crr_rx_dtor(struct fblock *fb)
 	fb_priv_cpu = per_cpu_ptr(fb_priv, 0);	/* CPUs share same priv. d */
 	rcu_read_unlock();
 
-	write_lock(&fb_priv_cpu->rx_lock);
+	write_lock(&fb_priv_cpu->rx_lock);					// LOCK
 	queue_len = skb_queue_len(fb_priv_cpu->list);
 	for (i = 0; i < queue_len; i++) {
 		skb_last = skb_dequeue(fb_priv_cpu->list);
 		kfree(skb_last);
 	}
 	kfree(fb_priv_cpu->list);
-	write_unlock(&fb_priv_cpu->rx_lock);
+	kfree(fb_priv_cpu->rx_seq_nr);
+	write_unlock(&fb_priv_cpu->rx_lock);					// UNLOCK
 
 	free_percpu(rcu_dereference_raw(fb->private_data));
 	module_put(THIS_MODULE);
