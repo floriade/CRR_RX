@@ -175,7 +175,7 @@ ACK:
 		memcpy(eth_hdr(cloned_skb)->h_dest, mac_src, 6);
 										
 		custom = custom | 0xF;						/* Write ACK Code */
-		*(cloned_skb->data + ETH_HDR_LEN) = custom;
+		*(cloned_skb->data + ETH_HDR_LEN + 14) = custom;
 										/* change idp order */
 		read_lock(&fb_priv_cpu->rx_lock);				// LOCK		
 		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R on port */
@@ -335,14 +335,17 @@ static void fb_crr_rx_dtor(struct fblock *fb)
 	struct sk_buff *skb_last;
 	struct fb_crr_rx_priv *fb_priv_cpu;
 	struct fb_crr_rx_priv __percpu *fb_priv;
+	printk(KERN_ERR "[CRR_RX] Deinitialization 1!\n");
 
 	rcu_read_lock();
 	fb_priv = (struct fb_crr_rx_priv __percpu *) rcu_dereference_raw(fb->private_data);
 	fb_priv_cpu = per_cpu_ptr(fb_priv, 0);	/* CPUs share same priv. d */
 	rcu_read_unlock();
+	printk(KERN_ERR "[CRR_RX] Deinitialization 2!\n");
 
 	write_lock(&fb_priv_cpu->rx_lock);					// LOCK
 	queue_len = skb_queue_len(fb_priv_cpu->list);
+	printk(KERN_ERR "[CRR_RX] Deinitialization Qlen: %d!\n", queue_len);
 	for (i = 0; i < queue_len; i++) {
 		skb_last = skb_dequeue(fb_priv_cpu->list);
 		kfree(skb_last);
