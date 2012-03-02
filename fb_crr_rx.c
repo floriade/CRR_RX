@@ -9,7 +9,7 @@
  */
 
 /*
- * ETH_TYPE | SEQ_NR | ACK
+ * ETH_TYPE | SEQ_NR | ACK|
  */
 
 #include <linux/kernel.h>
@@ -30,15 +30,31 @@
 #include "xt_builder.h"
 
 #define ETH_HDR_LEN	0
-#define WIN_SZ		16
+#define WIN_SZ		4
+#define BIT_FULL	(1 << 2*WIN_SZ) - 1
 
 struct fb_crr_rx_priv {
 	idp_t port[2];
 	seqlock_t lock;
 	rwlock_t *rx_lock;
+	unsigned char *rx_win_nr;
 	unsigned char *rx_seq_nr;
+	unsigned int *rx_bitstream;
 	struct sk_buff_head *list;
 };
+
+static unsigned char set_bit_pos(unsigned int *bitstream, unsigned char pos)
+{
+	if (*bitstream & (1 << (pos - 1))) 					/* bit is set */
+		return 0;
+	else {									/* bit is not set */
+		*bitstream |= (1 << (pos - 1));
+		if (*bitstream == BIT_FULL)					/* all Seq nr received */
+			*bitstream = 0;						/* reset and start new round */
+		return 1;
+	}
+
+}
 
 
 /* returns a pointer to the skb_buff with the according seq number */
@@ -47,12 +63,12 @@ static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
 	struct sk_buff *curr = list->next;
 
 	if (list->next == (struct sk_buff *)list) {				/* list is empty */
-		//printk(KERN_ERR "List is empty\n");		
+		printk(KERN_ERR "List is empty\n");		
 		return list->next;
 	}
 	
 	else if (seq == 2) {							/* Second element */
-		//printk(KERN_ERR "Seqnr 2 -> First element\n");
+		printk(KERN_ERR "Seqnr 2 -> First element\n");
 		return list->next;
 	}	
 		
@@ -65,7 +81,7 @@ static struct sk_buff *skb_get_pos(unsigned char seq, struct sk_buff_head *list)
 		}
 	
 		if (curr->next == (struct sk_buff *)list) {
-			//printk(KERN_ERR "Reached end of the list\n");
+			printk(KERN_ERR "Reached end of the list\n");
 			return (struct sk_buff *)list;
 		}
 		curr = curr->next;
@@ -81,7 +97,7 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 	unsigned int i, queue_len;
 	unsigned char mac_src[6];
 	unsigned char mac_dst[6];
-	unsigned char seq, ack;
+	unsigned char seq, win_nr;
 	struct sk_buff *skb_last, *cloned_skb;
 	struct fb_crr_rx_priv __percpu *fb_priv_cpu;
 
@@ -104,45 +120,57 @@ static int fb_crr_rx_netrx(const struct fblock * const fb,
 	else if (*dir == TYPE_INGRESS && ntohs(eth_hdr(skb)->h_proto) == 0xabba) {
 		cloned_skb = NULL;
 		seq = *(skb->data + ETH_HDR_LEN);
-		ack = *(skb->data + ETH_HDR_LEN+1);
-		//printk(KERN_ERR "Received packet\n");
-		write_lock(fb_priv_cpu->rx_lock);				// LOCK
-		//printk(KERN_ERR "Expected: %d\n", *fb_priv_cpu->rx_seq_nr);
-		//printk(KERN_ERR "Received: %d\n", seq);		
-		if (seq == *fb_priv_cpu->rx_seq_nr) {
+		win_nr = *(skb->data + ETH_HDR_LEN+1);
+		printk(KERN_ERR "Received packet %d\n", *(skb->data + ETH_HDR_LEN+2));
+		write_lock(fb_priv_cpu->rx_lock);
+		if (win_nr != *fb_priv_cpu->rx_win_nr) {			// new window
+			*fb_priv_cpu->rx_bitstream = 0;				// Reset bitstream for new window
+			*fb_priv_cpu->rx_win_nr = win_nr;
+			printk(KERN_ERR "New window detected\n");	
+		}				
+		printk(KERN_ERR "Expected: %d\t Received: %d\n", *fb_priv_cpu->rx_seq_nr, seq);	
+		if (likely(seq == *fb_priv_cpu->rx_seq_nr)) {
 			//printk(KERN_ERR "Correct Seqnr: %d\n", seq);		/* R Correct sequence number: */
+			*fb_priv_cpu->rx_seq_nr = (*fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
 			queue_len = skb_queue_len(fb_priv_cpu->list);
-			//printk(KERN_ERR "Qlen: %d\n", queue_len);		
+			printk(KERN_ERR "Qlen: %d\n", queue_len);
+			if(unlikely(!set_bit_pos(fb_priv_cpu->rx_bitstream, seq)))
+				printk(KERN_ERR "There is a Bug!\n");		
 			for (i = 1; i <= queue_len; i++) { 			/* R iterate over nr elements in queue */
-				//printk(KERN_ERR "%d\n", i);
+				printk(KERN_ERR "%d\n", i);
 				skb_last = skb_peek(fb_priv_cpu->list);
-				//printk(KERN_ERR "First Seqnr in Queue: %d\n", *(skb_last->data + ETH_HDR_LEN));
-				if (*(skb_last->data + ETH_HDR_LEN) == seq + i) {
-					//printk(KERN_ERR "Send following Seqnr: %d\n", seq + i);
+				printk(KERN_ERR "First Seqnr in Queue: %d\n", *(skb_last->data + ETH_HDR_LEN));
+				if (*(skb_last->data + ETH_HDR_LEN) == (seq % 2*WIN_SZ) + i) {
+					printk(KERN_ERR "Send following Seqnr: %d\n", (seq % 2*WIN_SZ) + i);
 					skb_last = skb_dequeue(fb_priv_cpu->list);/* Remove first element in list */
-					engine_backlog_tail(skb_last, *dir);	/* Send towards user space */
+					rcu_read_lock();
+					process_packet(skb_last, *dir);		/* Send towards user space */
+					rcu_read_unlock();
 					*fb_priv_cpu->rx_seq_nr = (*fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
 				}
 				else {
-					printk(KERN_ERR "Following Seqnr not found: %d\n", seq + i);	/* if next missing -> break */
+					printk(KERN_ERR "Following Seqnr not found: %d\n", (seq % 2*WIN_SZ) + i);	/* if next missing -> break */
 					break;
 				}	
 			}
-
-			*fb_priv_cpu->rx_seq_nr = (*fb_priv_cpu->rx_seq_nr % (2*WIN_SZ)) + 1;
 			//printk(KERN_ERR "Next Seqnr expected: %d\n", *fb_priv_cpu->rx_seq_nr);
 			write_unlock(fb_priv_cpu->rx_lock);			// UNLOCK
 		}
 		else {
 			//printk(KERN_ERR "Wrong Seqnr: %d\n", seq);		/* Wrong Seq number -> keep in buffer */
-			if ((skb_last = skb_get_pos(seq, fb_priv_cpu->list))) {	/* R find correct position */
+			if (likely(set_bit_pos(fb_priv_cpu->rx_bitstream, seq))) {	/* New packet -> pass */
+				if (!(skb_last = skb_get_pos(seq, fb_priv_cpu->list))) {
+					write_unlock(fb_priv_cpu->rx_lock);		// UNLOCK
+					drop = 1;
+					goto ACK;
+				}
 				skb_insert(skb_last, skb, fb_priv_cpu->list); 	/* W insert to position */
 				queue_len = skb_queue_len(fb_priv_cpu->list);
-				//printk(KERN_ERR "Added New Qlen: %d\n", queue_len);
+				printk(KERN_ERR "Added New Qlen: %d\n", queue_len);
 				write_unlock(fb_priv_cpu->rx_lock);		// UNLOCK
 				drop = 2;
 			}
-			else {
+			else {							/* Old packet -> drop */
 				write_unlock(fb_priv_cpu->rx_lock);		// UNLOCK
 				drop = 1;					/* Received packet for second time */
 			}
@@ -185,8 +213,10 @@ ACK:
 		read_lock(fb_priv_cpu->rx_lock);				// LOCK		
 		write_next_idp_to_skb(cloned_skb, fb_priv_cpu->port[TYPE_EGRESS], fb->idp); /* R on port */
 		read_unlock(fb_priv_cpu->rx_lock);				// UNLOCK
-		engine_backlog_tail(cloned_skb, TYPE_EGRESS);			/* schedule packet */
-		//printk(KERN_ERR "Send ACK done!\n");	
+		rcu_read_lock();		
+		process_packet(cloned_skb, TYPE_EGRESS);			/* schedule packet */
+		rcu_read_unlock();
+		printk(KERN_ERR "Send ACK done!\n");	
 	}
 	goto back;
 
@@ -270,8 +300,8 @@ static int fb_crr_rx_event(struct notifier_block *self, unsigned long cmd,
 static struct fblock *fb_crr_rx_ctor(char *name)
 {
 	int ret = 0;
-	unsigned int cpu;
-	unsigned char *expected_seq_nr;
+	unsigned int cpu, *tmp_rx_bitstream;
+	unsigned char *tmp_expected_seq_nr, *tmp_rx_win_nr;
 	struct sk_buff_head *tmp_list;
 	struct fblock *fb;
 	struct fb_crr_rx_priv __percpu *fb_priv;
@@ -283,9 +313,16 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 	if (!fb)
 		return NULL;
 
+
 	fb_priv = alloc_percpu(struct fb_crr_rx_priv);
 	if (!fb_priv)
 		goto err;
+
+	if (unlikely((tmp_rx_bitstream = kzalloc(sizeof(unsigned int), GFP_ATOMIC)) == NULL))
+		goto err_;
+
+	if (unlikely((tmp_rx_win_nr = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL))
+		goto err__;
 
 	if (unlikely((tmp_rx_lock = kzalloc(sizeof(rwlock_t), GFP_ATOMIC)) == NULL))
 		goto err0;
@@ -293,12 +330,15 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 	if (unlikely((tmp_list = kzalloc(sizeof(struct sk_buff_head), GFP_ATOMIC)) == NULL))
 		goto err1;
 
-	if (unlikely((expected_seq_nr = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL))
+	if (unlikely((tmp_expected_seq_nr = kzalloc(sizeof(unsigned char), GFP_ATOMIC)) == NULL))
 		goto err1a;
 	
 	rwlock_init(tmp_rx_lock);
 
-	*expected_seq_nr = 1;
+	*tmp_rx_bitstream = 0;
+	*tmp_rx_win_nr = 0;
+
+	*tmp_expected_seq_nr = 1;
 	
 	skb_queue_head_init(tmp_list);
 
@@ -311,8 +351,10 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 		fb_priv_cpu->rx_lock = tmp_rx_lock;		
 		fb_priv_cpu->port[0] = IDP_UNKNOWN;
 		fb_priv_cpu->port[1] = IDP_UNKNOWN;
-		fb_priv_cpu->rx_seq_nr = expected_seq_nr;
+		fb_priv_cpu->rx_seq_nr = tmp_expected_seq_nr;
 		fb_priv_cpu->list = tmp_list;
+		fb_priv_cpu->rx_bitstream = tmp_rx_bitstream;
+		fb_priv_cpu->rx_win_nr = tmp_rx_win_nr;
 	}
 	put_online_cpus();
 
@@ -330,13 +372,17 @@ static struct fblock *fb_crr_rx_ctor(char *name)
 err3:
 	cleanup_fblock_ctor(fb);
 err2:
-	kfree(expected_seq_nr);
+	kfree(tmp_expected_seq_nr);
 err1a:
 	kfree(tmp_list);
 err1:
 	kfree(tmp_rx_lock);
 	
 err0:
+	kfree(tmp_rx_win_nr); 
+err__:
+	kfree(tmp_rx_bitstream);
+err_:
 	free_percpu(fb_priv);
 err:
 	kfree_fblock(fb);
@@ -367,6 +413,8 @@ static void fb_crr_rx_dtor(struct fblock *fb)
 	}
 	kfree(fb_priv_cpu->list);
 	kfree(fb_priv_cpu->rx_seq_nr);
+	kfree(fb_priv_cpu->rx_win_nr);
+	kfree(fb_priv_cpu->rx_bitstream);
 	write_unlock(fb_priv_cpu->rx_lock);					// UNLOCK
 
 	free_percpu(rcu_dereference_raw(fb->private_data));
